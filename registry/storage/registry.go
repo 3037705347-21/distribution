@@ -4,6 +4,9 @@ import (
 	"context"
 	"regexp"
 	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/registry/storage/cache"
@@ -13,6 +16,10 @@ import (
 
 var (
 	DefaultConcurrencyLimit = runtime.GOMAXPROCS(0)
+
+	// defaultCatalogRefreshInterval bounds how stale a served catalog
+	// snapshot may be: a read against an older snapshot triggers a rebuild.
+	defaultCatalogRefreshInterval = 10 * time.Minute
 )
 
 // registry is the top-level implementation of Registry for use in the storage
@@ -31,6 +38,12 @@ type registry struct {
 	// Validation
 	manifestURLs         manifestURLs
 	validateImageIndexes validateImageIndexes
+
+	// Catalog projection: catalogSnapshot is the last published snapshot.
+	// Reads are served from it; catalogBuildMu serializes rebuilds.
+	catalogSnapshot        atomic.Pointer[catalogSnapshot]
+	catalogBuildMu         sync.Mutex
+	catalogRefreshInterval time.Duration
 }
 
 // manifestURLs holds regular expressions for controlling manifest URL whitelisting
@@ -63,9 +76,22 @@ func EnableRedirect(registry *registry) error {
 	return nil
 }
 
+// TagLookupConcurrencyLimit(concurrencyLimit) sets the maximum number of
+// concurrent goroutines used when looking up tags.
 func TagLookupConcurrencyLimit(concurrencyLimit int) RegistryOption {
 	return func(registry *registry) error {
 		registry.tagLookupConcurrencyLimit = concurrencyLimit
+		return nil
+	}
+}
+
+// CatalogRefreshInterval sets the maximum age of the catalog snapshot that
+// may be served to readers; a read against an older snapshot triggers a
+// rebuild. A value of 0 disables read-triggered rebuilds, leaving RefreshCatalog
+// as the only way to replace the snapshot.
+func CatalogRefreshInterval(interval time.Duration) RegistryOption {
+	return func(registry *registry) error {
+		registry.catalogRefreshInterval = interval
 		return nil
 	}
 }
@@ -176,6 +202,7 @@ func NewRegistry(ctx context.Context, driver storagedriver.StorageDriver, option
 		statter:                statter,
 		resumableDigestEnabled: true,
 		driver:                 driver,
+		catalogRefreshInterval: defaultCatalogRefreshInterval,
 	}
 
 	for _, option := range options {

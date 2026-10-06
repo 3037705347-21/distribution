@@ -114,6 +114,15 @@ const (
 //	blobPathSpec:                   <root>/v2/blobs/<algorithm>/<first two hex bytes of digest>/<hex digest>
 //	blobDataPathSpec:               <root>/v2/blobs/<algorithm>/<first two hex bytes of digest>/<hex digest>/data
 //
+//	Catalog projection:
+//
+//	catalogRootPathSpec:            <root>/v2/catalog
+//	catalogSnapshotPathSpec:        <root>/v2/catalog/current
+//	catalogStagingDirPathSpec:      <root>/v2/catalog/staging
+//	catalogStagingPathSpec:         <root>/v2/catalog/staging/<id>
+//	catalogAnnotationsDirPathSpec:  <root>/v2/catalog/annotations
+//	catalogAnnotationPathSpec:      <root>/v2/catalog/annotations/<name>.json
+//
 // For more information on the semantic meaning of each path and their
 // contents, please see the path spec documentation.
 func pathFor(spec pathSpec) (string, error) {
@@ -250,6 +259,21 @@ func pathFor(spec pathSpec) (string, error) {
 		return path.Join(append(repoPrefix, v.name, "_uploads", v.id, "hashstates", string(v.alg), offset)...), nil
 	case repositoriesRootPathSpec:
 		return path.Join(repoPrefix...), nil
+
+	// Catalog projection paths are kept outside of the repositories tree so
+	// they can never be picked up by repository scans.
+	case catalogRootPathSpec:
+		return path.Join(storagePathRoot, storagePathVersion, "catalog"), nil
+	case catalogSnapshotPathSpec:
+		return path.Join(storagePathRoot, storagePathVersion, "catalog", catalogSnapshotFile), nil
+	case catalogStagingDirPathSpec:
+		return path.Join(storagePathRoot, storagePathVersion, "catalog", catalogStagingDir), nil
+	case catalogStagingPathSpec:
+		return path.Join(storagePathRoot, storagePathVersion, "catalog", catalogStagingDir, v.id), nil
+	case catalogAnnotationsDirPathSpec:
+		return path.Join(storagePathRoot, storagePathVersion, "catalog", catalogAnnotationsDir), nil
+	case catalogAnnotationPathSpec:
+		return path.Join(storagePathRoot, storagePathVersion, "catalog", catalogAnnotationsDir, v.name+catalogAnnotationSuffix), nil
 	default:
 		// TODO(sday): This is an internal error. Ensure it doesn't escape (panic?).
 		return "", fmt.Errorf("unknown path spec: %#v", v)
@@ -449,6 +473,51 @@ func (uploadHashStatePathSpec) pathSpec() {}
 type repositoriesRootPathSpec struct{}
 
 func (repositoriesRootPathSpec) pathSpec() {}
+
+// Catalog projection path component names.
+const (
+	catalogSnapshotFile     = "current" // published snapshot object
+	catalogStagingDir       = "staging" // directory of in-progress builds
+	catalogAnnotationsDir   = "annotations"
+	catalogAnnotationSuffix = ".json"
+)
+
+// catalogRootPathSpec is the root of the catalog projection area.
+type catalogRootPathSpec struct{}
+
+func (catalogRootPathSpec) pathSpec() {}
+
+// catalogSnapshotPathSpec points at the currently published catalog snapshot.
+type catalogSnapshotPathSpec struct{}
+
+func (catalogSnapshotPathSpec) pathSpec() {}
+
+// catalogStagingDirPathSpec points at the directory holding staging objects
+// for in-progress snapshot builds.
+type catalogStagingDirPathSpec struct{}
+
+func (catalogStagingDirPathSpec) pathSpec() {}
+
+// catalogStagingPathSpec points at a single build's staging object.
+type catalogStagingPathSpec struct {
+	id string
+}
+
+func (catalogStagingPathSpec) pathSpec() {}
+
+// catalogAnnotationsDirPathSpec points at the directory holding
+// tenant-maintained per-repository display information.
+type catalogAnnotationsDirPathSpec struct{}
+
+func (catalogAnnotationsDirPathSpec) pathSpec() {}
+
+// catalogAnnotationPathSpec points at the display information file for a
+// single repository.
+type catalogAnnotationPathSpec struct {
+	name string
+}
+
+func (catalogAnnotationPathSpec) pathSpec() {}
 
 // digestPathComponents provides a consistent path breakdown for a given
 // digest. For a generic digest, it will be as follows:
