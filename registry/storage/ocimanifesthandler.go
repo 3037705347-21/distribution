@@ -8,6 +8,7 @@ import (
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/internal/dcontext"
 	"github.com/distribution/distribution/v3/manifest/ocischema"
+	"github.com/distribution/distribution/v3/registry/trustlease"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -18,6 +19,7 @@ type ocischemaManifestHandler struct {
 	blobStore    distribution.BlobStore
 	ctx          context.Context
 	manifestURLs manifestURLs
+	urlTrust     *trustlease.Manager
 }
 
 var _ ManifestHandler = &ocischemaManifestHandler{}
@@ -80,6 +82,16 @@ func (ms *ocischemaManifestHandler) verifyManifest(ctx context.Context, mnfst oc
 
 	blobsService := ms.repository.Blobs(ctx)
 
+	// A trust lease delivered for this target repository replaces the global
+	// URL policy. Leases outside their validity window, or absent leases,
+	// leave the global policy in effect.
+	urlAllow, urlDeny := ms.manifestURLs.allow, ms.manifestURLs.deny
+	if ms.urlTrust != nil {
+		if allow, deny, ok := ms.urlTrust.Policy(ms.repository.Named().Name()); ok {
+			urlAllow, urlDeny = allow, deny
+		}
+	}
+
 	for _, descriptor := range mnfst.References() {
 		err := descriptor.Digest.Validate()
 		if err != nil {
@@ -89,8 +101,8 @@ func (ms *ocischemaManifestHandler) verifyManifest(ctx context.Context, mnfst oc
 
 		switch descriptor.MediaType {
 		case v1.MediaTypeImageLayer, v1.MediaTypeImageLayerGzip, v1.MediaTypeImageLayerNonDistributable, v1.MediaTypeImageLayerNonDistributableGzip: //nolint:staticcheck // ignore A1019: v1.MediaTypeImageLayerNonDistributable is deprecated: Non-distributable layers are deprecated, and not recommended for future use.
-			allow := ms.manifestURLs.allow
-			deny := ms.manifestURLs.deny
+			allow := urlAllow
+			deny := urlDeny
 			for _, u := range descriptor.URLs {
 				var pu *url.URL
 				pu, err = url.Parse(u)

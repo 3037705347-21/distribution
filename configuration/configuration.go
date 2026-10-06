@@ -755,8 +755,29 @@ type ValidationManifests struct {
 	// URLs configures validation for URLs in pushed manifests.
 	URLs URLs `yaml:"urls,omitempty"`
 
+	// TrustLeases configures per-repository trust leases for the external URLs
+	// in pushed manifests. When an active lease exists for the target
+	// repository, it replaces the global URLs allow/deny rules for that
+	// repository.
+	TrustLeases TrustLeases `yaml:"trustleases,omitempty"`
+
 	// ImageIndexes configures validation of image indexes
 	Indexes ValidationIndexes `yaml:"indexes,omitempty"`
+}
+
+// TrustLeases configures delivery of per-repository, versioned trust leases
+// for external URLs in pushed manifests.
+type TrustLeases struct {
+	// StoragePath is the path within the configured storage driver from which
+	// the lease document is loaded (and to which it is published). The
+	// document is loaded when the registry starts; persistence keeps trust
+	// decisions stable across restarts.
+	StoragePath string `yaml:"storagepath,omitempty"`
+
+	// RefreshInterval is the interval at which the lease document is reloaded
+	// from storage. A zero value disables periodic reload; the document is
+	// still loaded once at startup.
+	RefreshInterval time.Duration `yaml:"refreshinterval,omitempty"`
 }
 
 // URLs defines validation rules for URLs found in the manifests pushed to the registry.

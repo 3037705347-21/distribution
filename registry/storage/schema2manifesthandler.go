@@ -9,6 +9,7 @@ import (
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/internal/dcontext"
 	"github.com/distribution/distribution/v3/manifest/schema2"
+	"github.com/distribution/distribution/v3/registry/trustlease"
 	"github.com/opencontainers/go-digest"
 )
 
@@ -23,6 +24,7 @@ type schema2ManifestHandler struct {
 	blobStore    distribution.BlobStore
 	ctx          context.Context
 	manifestURLs manifestURLs
+	urlTrust     *trustlease.Manager
 }
 
 var _ ManifestHandler = &schema2ManifestHandler{}
@@ -85,6 +87,16 @@ func (ms *schema2ManifestHandler) verifyManifest(ctx context.Context, mnfst sche
 
 	blobsService := ms.repository.Blobs(ctx)
 
+	// A trust lease delivered for this target repository replaces the global
+	// URL policy. Leases outside their validity window, or absent leases,
+	// leave the global policy in effect.
+	urlAllow, urlDeny := ms.manifestURLs.allow, ms.manifestURLs.deny
+	if ms.urlTrust != nil {
+		if allow, deny, ok := ms.urlTrust.Policy(ms.repository.Named().Name()); ok {
+			urlAllow, urlDeny = allow, deny
+		}
+	}
+
 	for _, descriptor := range mnfst.References() {
 		err := descriptor.Digest.Validate()
 		if err != nil {
@@ -99,8 +111,8 @@ func (ms *schema2ManifestHandler) verifyManifest(ctx context.Context, mnfst sche
 			if len(descriptor.URLs) == 0 {
 				err = errMissingURL
 			}
-			allow := ms.manifestURLs.allow
-			deny := ms.manifestURLs.deny
+			allow := urlAllow
+			deny := urlDeny
 			for _, u := range descriptor.URLs {
 				var pu *url.URL
 				pu, err = url.Parse(u)

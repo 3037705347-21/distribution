@@ -8,6 +8,7 @@ import (
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/registry/storage/cache"
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
+	"github.com/distribution/distribution/v3/registry/trustlease"
 	"github.com/distribution/reference"
 )
 
@@ -30,6 +31,7 @@ type registry struct {
 
 	// Validation
 	manifestURLs         manifestURLs
+	urlTrustLeases       *trustlease.Manager
 	validateImageIndexes validateImageIndexes
 }
 
@@ -96,6 +98,17 @@ func ManifestURLsAllowRegexp(r *regexp.Regexp) RegistryOption {
 func ManifestURLsDenyRegexp(r *regexp.Regexp) RegistryOption {
 	return func(registry *registry) error {
 		registry.manifestURLs.deny = r
+		return nil
+	}
+}
+
+// ManifestURLTrustLeases is a functional option for NewRegistry. It installs
+// the manager holding per-repository trust leases for the external URLs in
+// pushed manifests. When a lease is active for the target repository it
+// replaces the global allow/deny regular expressions for that repository.
+func ManifestURLTrustLeases(m *trustlease.Manager) RegistryOption {
+	return func(registry *registry) error {
+		registry.urlTrustLeases = m
 		return nil
 	}
 }
@@ -299,6 +312,7 @@ func (repo *repository) Manifests(ctx context.Context, options ...distribution.M
 			repository:   repo,
 			blobStore:    blobStore,
 			manifestURLs: repo.registry.manifestURLs,
+			urlTrust:     repo.registry.urlTrustLeases,
 		},
 		manifestListHandler: manifestListHandler,
 		ocischemaHandler: &ocischemaManifestHandler{
@@ -306,6 +320,7 @@ func (repo *repository) Manifests(ctx context.Context, options ...distribution.M
 			repository:   repo,
 			blobStore:    blobStore,
 			manifestURLs: repo.registry.manifestURLs,
+			urlTrust:     repo.registry.urlTrustLeases,
 		},
 		ocischemaIndexHandler: &ocischemaIndexHandler{
 			manifestListHandler: manifestListHandler,

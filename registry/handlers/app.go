@@ -38,6 +38,7 @@ import (
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/factory"
 	storagemiddleware "github.com/distribution/distribution/v3/registry/storage/driver/middleware"
+	"github.com/distribution/distribution/v3/registry/trustlease"
 	"github.com/distribution/distribution/v3/version"
 	"github.com/distribution/reference"
 	events "github.com/docker/go-events"
@@ -266,6 +267,30 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 				re := regexp.MustCompile(strings.Join(config.Validation.Manifests.URLs.Deny, "|"))
 				options = append(options, storage.ManifestURLsDenyRegexp(re))
 			}
+		}
+
+		// configure per-repository trust leases for external URLs
+		if leasePath := config.Validation.Manifests.TrustLeases.StoragePath; leasePath != "" {
+			leaseManager := trustlease.NewManager()
+			leaseStore, err := trustlease.NewStore(app.driver, leasePath, leaseManager)
+			if err != nil {
+				panic(fmt.Sprintf("validation.manifests.trustleases.storagepath: %s", err))
+			}
+			// Load the persisted document before serving traffic. A missing
+			// document is expected; an unreadable or invalid document leaves
+			// no leases installed and periodic refresh picks up a fixed one.
+			if _, err := leaseStore.Load(app); err != nil {
+				dcontext.GetLogger(app).WithError(err).Error("failed to load trust lease document; serving without per-repository leases")
+			} else if leaseManager.Version() > 0 {
+				dcontext.GetLogger(app).Infof("loaded trust lease document version %d", leaseManager.Version())
+			}
+			if interval := config.Validation.Manifests.TrustLeases.RefreshInterval; interval > 0 {
+				logger := dcontext.GetLogger(app)
+				leaseStore.StartRefresh(app, interval, func(err error) {
+					logger.WithError(err).Error("failed to reload trust lease document; keeping previous version active")
+				})
+			}
+			options = append(options, storage.ManifestURLTrustLeases(leaseManager))
 		}
 
 		switch config.Validation.Manifests.Indexes.Platforms {
