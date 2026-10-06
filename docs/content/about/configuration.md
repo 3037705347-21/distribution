@@ -196,6 +196,9 @@ auth:
     signingalgorithms:
         - EdDSA
         - HS256
+    revocation:
+        path: /etc/registry/token-revocation.json
+        interval: 60s
   htpasswd:
     realm: basic-realm
     path: /path/to/htpasswd
@@ -623,6 +626,10 @@ auth:
         - EdDSA
         - HS256
         - ES512
+    revocation:
+        url: https://example.com/token-revocation.json
+        interval: 60s
+        timeout: 10s
   htpasswd:
     realm: basic-realm
     path: /path/to/htpasswd
@@ -668,6 +675,7 @@ security.
 | `autoredirectpath`   | no       | The path to redirect to if `autoredirect` is set to `true`, default: `/auth/token/`. |
 | `signingalgorithms`  | no       | A list of token signing algorithms to use for verifying token signatures. If left empty the default list of signing algorithms is used. Please see below for allowed values and default. |
 | `jwks`               | no       | The absolute path to the JSON Web Key Set (JWKS) file. The JWKS file contains the trusted keys used to verify the signature of authentication tokens. |
+| `revocation`         | no       | Configuration of the token revocation list. See [Token revocation](#token-revocation) below. |
 
 Available `signingalgorithms`:
 - EdDSA
@@ -703,6 +711,73 @@ Additional notes on `rootcertbundle`:
 
 - The public key of this certificate will be automatically added to the list of known keys.
 - The public key will be identified by its JWK Thumbprint. See [RFC 7638](https://datatracker.ietf.org/doc/html/rfc7638) and [RFC 8037](https://datatracker.ietf.org/doc/html/rfc8037) for reference.
+
+#### Token revocation
+
+The optional `revocation` block lets the registry deny specific already
+issued bearer tokens without rotating the signing key or waiting for them to
+expire. Revocation is driven by a continuously refreshed **complete
+snapshot** list of revoked credentials. Exactly one source must be
+configured:
+
+| Parameter  | Required | Description |
+|------------|----------|-------------|
+| `path`     | one of `path`/`url` | Absolute path to a local revocation list file. The file must be published atomically (write to a temporary file in the same directory, then rename). |
+| `url`      | one of `path`/`url` | An `http`/`https` endpoint serving the revocation list. Polling uses conditional requests (`If-None-Match`/`If-Modified-Since`) and applies `304 Not Modified` responses without changing state. |
+| `interval` | no       | Polling interval as a [Go duration](https://pkg.go.dev/time#ParseDuration), default `60s`. Values below `1s` are raised to `1s`. |
+| `timeout`  | no       | Timeout of a single HTTP refresh request as a Go duration, default `10s`. Ignored for `path`. |
+
+Example:
+
+```yaml
+auth:
+  token:
+    realm: token-realm
+    service: token-service
+    issuer: registry-token-issuer
+    rootcertbundle: /root/certs/bundle
+    revocation:
+      path: /etc/registry/token-revocation.json
+      interval: 60s
+```
+
+The revocation list is a JSON document. Every revoked credential currently in
+effect must be listed; updates replace the whole document atomically:
+
+```json
+{
+  "version": 1,
+  "revoked": [
+    {"iss": "registry-token-issuer", "jti": "revoked-everywhere"},
+    {"iss": "registry-token-issuer", "jti": "abc-123", "aud": "token-service"},
+    {"iss": "registry-token-issuer", "jti": "def-456", "repository": "samalba/my-app"},
+    {"iss": "registry-token-issuer", "jti": "ghi-789", "repository": "samalba/my-app", "actions": ["pull"]}
+  ]
+}
+```
+
+Entry semantics:
+
+- `iss` and `jti` are required and identify a token through its `iss` and
+  `jti` claims. Tokens issued without a `jti` cannot be revoked this way.
+- `aud`, `repository` and `actions` are optional selectors that narrow the
+  revocation; an omitted selector matches every value. Thus an entry with
+  only `iss`/`jti` revokes the whole token, while `"actions": ["pull"]` on a
+  specific repository denies pull requests but leaves push (and every other
+  repository) authorized. `actions` only accepts `pull` and `push`.
+- Every registry instance configured with the same source converges to the
+  same complete state; the state is rebuilt from the source on restart and
+  reloading unchanged content is a no-op.
+
+Failure behavior:
+
+- The list is loaded once, synchronously, at startup. If it cannot be
+  fetched or parsed, the registry logs the error and refuses to start, so a
+  configured revocation mechanism can never silently run with an empty list.
+- If a later refresh fails (source unavailable, malformed document, unknown
+  field, entry larger than the 16 MiB document limit), the update is rejected
+  wholesale and the previous complete list stays in effect; a warning is
+  logged and the registry retries at the next interval.
 
 For more information about Token based authentication configuration, see the
 [specification](../spec/auth/token.md).

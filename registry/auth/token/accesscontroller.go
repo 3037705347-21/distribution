@@ -1,6 +1,7 @@
 package token
 
 import (
+	"context"
 	"crypto"
 	"crypto/x509"
 	"encoding/json"
@@ -12,8 +13,10 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/distribution/distribution/v3/registry/auth"
+	"github.com/distribution/distribution/v3/registry/auth/token/revocation"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/sirupsen/logrus"
 )
@@ -80,6 +83,10 @@ func (s accessSet) scopeParam() string {
 var (
 	ErrInsufficientScope = errors.New("insufficient scope")
 	ErrTokenRequired     = errors.New("authorization token required")
+	// ErrTokenRevoked is returned when the presented token matches an
+	// entry of the configured revocation list. It is surfaced to clients
+	// as the OAuth "invalid_token" error.
+	ErrTokenRevoked = errors.New("token has been revoked")
 )
 
 // authChallenge implements the auth.Challenge interface.
@@ -136,7 +143,7 @@ func (ac authChallenge) challengeParams(r *http.Request) string {
 	}
 
 	switch ac.err {
-	case ErrInvalidToken, ErrMalformedToken:
+	case ErrInvalidToken, ErrMalformedToken, ErrTokenRevoked:
 		str = fmt.Sprintf("%s,error=%q", str, "invalid_token")
 	case ErrInsufficientScope:
 		str = fmt.Sprintf("%s,error=%q", str, "insufficient_scope")
@@ -160,6 +167,10 @@ type accessController struct {
 	rootCerts         *x509.CertPool
 	trustedKeys       map[string]crypto.PublicKey
 	signingAlgorithms []jose.SignatureAlgorithm
+	// revocation is optional. When configured, presented tokens are
+	// additionally checked against its current snapshot; it is nil when
+	// revocation is disabled, leaving the read path unchanged.
+	revocation *revocation.Loader
 }
 
 const (
@@ -177,6 +188,7 @@ type tokenAccessOptions struct {
 	rootCertBundle    string
 	jwks              string
 	signingAlgorithms []string
+	revocation        *revocation.Config
 }
 
 // checkOptions gathers the necessary options
@@ -244,7 +256,59 @@ func checkOptions(options map[string]any) (tokenAccessOptions, error) {
 		}
 	}
 
+	if revocationVal, ok := options["revocation"]; ok {
+		revocationConfig, err := parseRevocationOptions(revocationVal)
+		if err != nil {
+			return tokenAccessOptions{}, err
+		}
+		opts.revocation = revocationConfig
+	}
+
 	return opts, nil
+}
+
+// parseRevocationOptions parses the optional "revocation" configuration
+// block: exactly one of "path" or "url", plus optional "interval" and
+// "timeout" Go duration strings.
+func parseRevocationOptions(raw any) (*revocation.Config, error) {
+	values, ok := raw.(map[string]any)
+	if !ok {
+		return nil, errors.New("token revocation requires a map of configuration options")
+	}
+
+	config := &revocation.Config{}
+	for key, value := range values {
+		switch key {
+		case "path", "url":
+			strValue, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("token revocation %q must be a string", key)
+			}
+			if key == "path" {
+				config.Path = strValue
+			} else {
+				config.URL = strValue
+			}
+		case "interval", "timeout":
+			strValue, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("token revocation %q must be a duration string", key)
+			}
+			duration, err := time.ParseDuration(strValue)
+			if err != nil {
+				return nil, fmt.Errorf("token revocation %q must be a valid duration: %w", key, err)
+			}
+			if key == "interval" {
+				config.Interval = duration
+			} else {
+				config.Timeout = duration
+			}
+		default:
+			return nil, fmt.Errorf("unknown token revocation option %q", key)
+		}
+	}
+
+	return config, nil
 }
 
 var (
@@ -373,6 +437,16 @@ func newAccessController(options map[string]any) (auth.AccessController, error) 
 		signAlgos = defaultSigningAlgorithms
 	}
 
+	var revocationLoader *revocation.Loader
+	if config.revocation != nil {
+		// The initial load is synchronous and must succeed: the registry
+		// refuses to start rather than running without revocations enforced.
+		revocationLoader, err = revocation.New(context.Background(), *config.revocation)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize token revocation list: %w", err)
+		}
+	}
+
 	return &accessController{
 		realm:             config.realm,
 		autoRedirect:      config.autoRedirect,
@@ -382,6 +456,7 @@ func newAccessController(options map[string]any) (auth.AccessController, error) 
 		rootCerts:         rootPool,
 		trustedKeys:       trustedKeys,
 		signingAlgorithms: signAlgos,
+		revocation:        revocationLoader,
 	}, nil
 }
 
@@ -422,11 +497,37 @@ func (ac *accessController) Authorized(req *http.Request, accessItems ...auth.Ac
 	}
 
 	accessSet := claims.accessSet()
+
+	// The snapshot is an immutable, atomically published value; reading it
+	// here does not take a lock and every access item below is checked
+	// against the same snapshot.
+	var revokedSnapshot *revocation.Snapshot
+	if ac.revocation != nil {
+		revokedSnapshot = ac.revocation.Current()
+	}
+
 	for _, access := range accessItems {
 		if !accessSet.contains(access) {
 			challenge.err = ErrInsufficientScope
 			return nil, challenge
 		}
+		if revokedSnapshot != nil && revokedSnapshot.IsRevoked(
+			claims.Issuer, claims.JWTID, claims.Audience,
+			access.Resource, access.Action,
+		) {
+			challenge.err = ErrTokenRevoked
+			return nil, challenge
+		}
+	}
+
+	// Requests carrying no required access (e.g. base endpoints) are still
+	// denied for tokens revoked wholesale (an entry with only iss and jti).
+	if len(accessItems) == 0 && revokedSnapshot != nil && revokedSnapshot.IsRevoked(
+		claims.Issuer, claims.JWTID, claims.Audience,
+		auth.Resource{}, "",
+	) {
+		challenge.err = ErrTokenRevoked
+		return nil, challenge
 	}
 
 	return &auth.Grant{
