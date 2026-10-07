@@ -10,6 +10,7 @@ import (
 
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/internal/dcontext"
+	"github.com/distribution/distribution/v3/registry/storage/accounting"
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
@@ -40,6 +41,54 @@ type blobWriter struct {
 
 	resumableDigestEnabled bool
 	committed              bool
+
+	// reservation is the ledger reservation backing this upload; nil when
+	// accounting is disabled.
+	reservation *accounting.Reservation
+}
+
+// quotaGrowUnit bounds the number of reservation growth events produced while
+// streaming an upload whose total size is not known up front.
+const quotaGrowUnit int64 = 1 << 20 // 1 MiB
+
+// growReservation raises the upload reservation high-water mark to cover
+// bw.written+incoming bytes. Geometric growth keeps ledger event counts
+// logarithmic in the upload size. The check happens before the bytes are
+// written, so over-budget uploads fail before touching the upload data file.
+func (bw *blobWriter) growReservation(incoming int64) error {
+	if bw.reservation == nil {
+		return nil
+	}
+	target := bw.written + incoming
+	if target <= bw.reservation.Size {
+		return nil
+	}
+	grown := bw.reservation.Size
+	if grown == 0 {
+		grown = quotaGrowUnit
+	}
+	for grown < target {
+		grown *= 2
+	}
+	ledger := bw.blobStore.ledger()
+	if ledger == nil {
+		return nil
+	}
+	if err := ledger.Adjust(bw.ctx, bw.reservation, grown, accounting.PhaseUpload); err != nil {
+		// Geometric growth overshot the budget. Retry with the exact target
+		// so a slightly-too-large upload fails with its real byte count and
+		// an upload that actually fits at the target is admitted.
+		var qe *accounting.ErrQuotaExceeded
+		if errors.As(err, &qe) && target != grown {
+			if retryErr := ledger.Adjust(bw.ctx, bw.reservation, target, accounting.PhaseUpload); retryErr == nil {
+				return nil
+			} else {
+				return retryErr
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 var _ distribution.BlobWriter = &blobWriter{}
@@ -70,6 +119,14 @@ func (bw *blobWriter) Commit(ctx context.Context, desc v1.Descriptor) (v1.Descri
 		return v1.Descriptor{}, err
 	}
 
+	// Hard quota gate: the final size is known now and the blob has not yet
+	// been moved into the content-addressable store or linked.
+	if bw.reservation != nil {
+		if err := bw.blobStore.ledger().Adjust(ctx, bw.reservation, canonical.Size, accounting.PhaseUpload); err != nil {
+			return v1.Descriptor{}, err
+		}
+	}
+
 	if err := bw.moveBlob(ctx, canonical); err != nil {
 		return v1.Descriptor{}, err
 	}
@@ -85,6 +142,17 @@ func (bw *blobWriter) Commit(ctx context.Context, desc v1.Descriptor) (v1.Descri
 	err = bw.blobStore.blobAccessController.SetDescriptor(ctx, canonical.Digest, canonical)
 	if err != nil {
 		return v1.Descriptor{}, err
+	}
+
+	// Settle the reservation into the repository ledger. A failure here does
+	// not fail the commit (the blob is already committed and linked); the
+	// reconciler repairs the missing settle against physical state.
+	if bw.reservation != nil {
+		if err := bw.blobStore.ledger().Settle(ctx, bw.reservation, canonical.Digest, accounting.RoleLayer, canonical.Size); err != nil {
+			dcontext.GetLogger(ctx).WithError(err).
+				WithField("digest", canonical.Digest).
+				Error("accounting: failed to settle blob upload; ledger will reconcile")
+		}
 	}
 
 	bw.committed = true
@@ -103,7 +171,16 @@ func (bw *blobWriter) Cancel(ctx context.Context) error {
 		dcontext.GetLogger(ctx).Errorf("error closing blobwriter: %s", err)
 	}
 
-	return bw.removeResources(ctx)
+	if err := bw.removeResources(ctx); err != nil {
+		return err
+	}
+
+	if bw.reservation != nil {
+		if err := bw.blobStore.ledger().Release(ctx, bw.reservation); err != nil {
+			dcontext.GetLogger(ctx).Errorf("error releasing ledger reservation: %v", err)
+		}
+	}
+	return nil
 }
 
 func (bw *blobWriter) Size() int64 {
@@ -115,6 +192,11 @@ func (bw *blobWriter) Write(p []byte) (int, error) {
 	// written to the digester. If not, we need to update the digest state to
 	// match the current write position.
 	if err := bw.resumeDigest(bw.blobStore.ctx); err != nil && err != errResumableDigestNotAvailable {
+		return 0, err
+	}
+
+	// Enforce the quota before the bytes land in storage.
+	if err := bw.growReservation(int64(len(p))); err != nil {
 		return 0, err
 	}
 
@@ -137,6 +219,10 @@ func (bw *blobWriter) ReadFrom(r io.Reader) (n int64, err error) {
 		return 0, err
 	}
 
+	// Grow the reservation (and therefore enforce the quota) as bytes are
+	// read, before they are tee'd into the upload data file.
+	r = &quotaReader{src: r, bw: bw}
+
 	// Using a TeeReader instead of MultiWriter ensures Copy returns
 	// the amount written to the digester as well as ensuring that we
 	// write to the fileWriter first
@@ -145,6 +231,24 @@ func (bw *blobWriter) ReadFrom(r io.Reader) (n int64, err error) {
 	bw.written += nn
 
 	return nn, err
+}
+
+// quotaReader grows the upload reservation as data flows through it. When the
+// repository budget is exhausted it returns the accounting error instead of
+// delivering the bytes, which aborts the upload before the temp data grows.
+type quotaReader struct {
+	src io.Reader
+	bw  *blobWriter
+}
+
+func (q *quotaReader) Read(p []byte) (int, error) {
+	n, err := q.src.Read(p)
+	if n > 0 {
+		if gErr := q.bw.growReservation(int64(n)); gErr != nil {
+			return 0, gErr
+		}
+	}
+	return n, err
 }
 
 func (bw *blobWriter) Close() error {

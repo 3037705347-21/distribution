@@ -606,6 +606,67 @@ redirect:
   disable: true
 ```
 
+## `accounting`
+
+The optional `accounting` section enables the per-repository usage ledger and
+storage quota enforcement. When enabled, every blob push, cross-repository
+mount and manifest put reserves its bytes before writing and settles into the
+repository ledger after the write commits. Requests that would exceed the
+repository budget fail with HTTP `507 Insufficient Storage`
+(`QUOTA_EXCEEDED`) before any blob data or link is created. Shared blobs are
+counted per repository that references them (logical usage); physical blobs
+are still deduplicated in the backend. The ledger is stored next to the
+registry data under `v2/accounting/` as an append-only, crash-safe event log.
+
+Accounting is disabled by default; it is also not applied to pull-through
+cache registries.
+
+| Parameter | Required | Description |
+| --------- | -------- | ----------- |
+| `enabled` | no | Set to `true` to enable the ledger and quota enforcement. Defaults to `false`. |
+| `releaseonuntag` | no | When `true` (default), deleting a tag immediately releases revisions and blob links that become unreachable from any remaining tag; their byte usage leaves the ledger without waiting for GC. Set to `false` to keep pre-GC behavior. Deleting a manifest by digest always releases its now-unreferenced closure. |
+| `reservationttl` | no | Duration after which abandoned reservations from crashed/interrupted push and mount requests are reclaimed. Defaults to `24h`. |
+| `reconcile.onstart` | no | Run a ledger reconciliation pass against physical links at startup. Useful to seed the ledger when accounting is first enabled. Defaults to `false`. |
+| `reconcile.interval` | no | Duration between periodic reconciliation and stale-reservation sweeps. `0` disables periodic runs. Defaults to `0`. |
+
+### `budget`
+
+The byte budget applied to repositories. A repository without a matching rule
+is not limited and can use unlimited storage.
+
+| Parameter | Description |
+| --------- | ----------- |
+| `default` | Size applied to every repository not matched by a repository rule. Omit (or leave empty) for unlimited default usage. |
+| `repositories` | Map of repository name glob (`*` does not cross a `/` path component) to size. The most specific matching rule wins; the glob `*` acts as a top-level fallback. |
+
+Sizes accept common units such as `500MiB`, `10GiB` or `1024` (bytes).
+
+Example:
+
+```yaml
+accounting:
+  enabled: true
+  releaseonuntag: true
+  reservationttl: 24h
+  reconcile:
+    onstart: true
+    interval: 1h
+  budget:
+    default: 10GiB
+    repositories:
+      "library/*": "100GiB"
+```
+
+With accounting enabled the metrics endpoint (see [`http.debug.prometheus`](#debug))
+exposes the `registry_accounting_*` series: per-repository settled bytes,
+active reservation bytes, configured budget and remaining bytes, plus a
+cumulative `quota_denied_total{repository,phase}` counter.
+
+> **NOTE**: Physical blob data is never deleted by online tag/manifest
+> deletes; only repository links and the ledger are updated. The offline
+> garbage collector (`registry garbage-collect`) remains responsible for
+> reclaiming physical bytes and keeps the ledger in sync while doing so.
+
 ## `auth`
 
 ```yaml

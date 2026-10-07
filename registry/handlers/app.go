@@ -33,6 +33,7 @@ import (
 	repositorymiddleware "github.com/distribution/distribution/v3/registry/middleware/repository"
 	"github.com/distribution/distribution/v3/registry/proxy"
 	"github.com/distribution/distribution/v3/registry/storage"
+	"github.com/distribution/distribution/v3/registry/storage/accounting"
 	memorycache "github.com/distribution/distribution/v3/registry/storage/cache/memory"
 	rediscache "github.com/distribution/distribution/v3/registry/storage/cache/redis"
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
@@ -80,6 +81,14 @@ type App struct {
 	}
 
 	redis redis.UniversalClient
+
+	// accounting is the optional per-repository usage ledger service; nil
+	// when disabled or for pull-through caches.
+	accounting *accounting.Service
+
+	// accountingMaintenanceDone is closed when the reconciliation background
+	// loop exits.
+	accountingMaintenanceDone <-chan struct{}
 
 	// isCache is true if this registry is configured as a pull through cache
 	isCache bool
@@ -176,6 +185,29 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 	app.configureLogHook(config)
 
 	options := registrymiddleware.GetRegistryOptions()
+
+	// configure per-repository accounting ledger and budgets. Pull-through
+	// caches do not account or enforce quotas.
+	if config.Accounting.Enabled && !app.isCache {
+		budgets, err := accounting.NewBudgets(config.Accounting.Budget.Default, config.Accounting.Budget.Repositories)
+		if err != nil {
+			panic(err)
+		}
+		releaseOnUntag := true
+		if config.Accounting.ReleaseOnUntag != nil {
+			releaseOnUntag = *config.Accounting.ReleaseOnUntag
+		}
+		service, err := accounting.NewService(app.driver, budgets, accounting.RuntimeConfig{
+			ReleaseOnUntag: releaseOnUntag,
+			ReservationTTL: config.Accounting.ReservationTTL,
+		})
+		if err != nil {
+			panic(err)
+		}
+		app.accounting = service
+		options = append(options, storage.AccountingService(service))
+		dcontext.GetLogger(app).Info("per-repository accounting and quota enforcement enabled")
+	}
 
 	if config.HTTP.Host != "" {
 		u, err := url.Parse(config.HTTP.Host)
@@ -337,6 +369,18 @@ func NewApp(ctx context.Context, config *configuration.Configuration) *App {
 		app.registry, err = storage.NewRegistry(app.Context, app.driver, options...)
 		if err != nil {
 			panic("could not create registry: " + err.Error())
+		}
+	}
+
+	// Start ledger reconciliation/sweep background loop on the concrete
+	// registry (before registry/proxy middleware wraps it).
+	if app.accounting != nil {
+		if reg, ok := app.registry.(interface {
+			RunAccountingMaintenance(context.Context, bool, time.Duration) <-chan struct{}
+		}); ok {
+			app.accountingMaintenanceDone = reg.RunAccountingMaintenance(app,
+				config.Accounting.Reconcile.OnStart,
+				config.Accounting.Reconcile.Interval)
 		}
 	}
 

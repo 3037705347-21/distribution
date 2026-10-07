@@ -148,10 +148,23 @@ func (ms *manifestStore) Put(ctx context.Context, manifest distribution.Manifest
 	return "", fmt.Errorf("unrecognized manifest type %T", manifest)
 }
 
-// Delete removes the revision of the specified manifest.
+// Delete removes the revision of the specified manifest and, when accounting
+// is enabled, immediately releases layer links and revisions that are no
+// longer referenced by any remaining revision in the repository.
 func (ms *manifestStore) Delete(ctx context.Context, dgst digest.Digest) error {
 	dcontext.GetLogger(ms.ctx).Debug("(*manifestStore).Delete")
-	return ms.blobStore.Delete(ctx, dgst)
+
+	// Compute the closure before removing the revision, while its payload is
+	// still readable.
+	removed := ms.reclaimDeletedManifest(ctx, dgst)
+
+	if err := ms.blobStore.Delete(ctx, dgst); err != nil {
+		return err
+	}
+
+	// Reclaim links/revisions exclusive to the removed closure.
+	ms.postDeleteReclaim(ctx, removed)
+	return nil
 }
 
 func (ms *manifestStore) Enumerate(ctx context.Context, ingester func(digest.Digest) error) error {

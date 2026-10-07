@@ -330,7 +330,11 @@ func (imh *manifestHandler) PutManifest(w http.ResponseWriter, r *http.Request) 
 		case errcode.Error:
 			imh.Errors = append(imh.Errors, err)
 		default:
-			imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+			if qerr, ok := asQuotaError(err); ok {
+				imh.Errors = append(imh.Errors, qerr)
+			} else {
+				imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+			}
 		}
 		return
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/distribution/distribution/v3"
+	"github.com/distribution/distribution/v3/registry/storage/accounting"
 	"github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/reference"
 	"github.com/opencontainers/go-digest"
@@ -21,6 +22,16 @@ type GCOpts struct {
 	DryRun         bool
 	RemoveUntagged bool
 	Quiet          bool
+
+	// Accounting, when set, makes the GC emit idempotent ledger debit events
+	// for every removed layer link and manifest revision. Nil leaves the
+	// ledger untouched (a subsequent reconciliation repairs it anyway).
+	Accounting accountingLedger
+}
+
+// accountingLedger is the small GC-facing surface of the accounting service.
+type accountingLedger interface {
+	Debit(ctx context.Context, repo string, dgst digest.Digest, role accounting.Role) error
 }
 
 // ManifestDel contains manifest structure which will be deleted
@@ -149,7 +160,12 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 		for _, obj := range manifestArr {
 			err = vacuum.RemoveManifest(obj.Name, obj.Digest, obj.Tags)
 			if err != nil {
-				return fmt.Errorf("failed to delete manifest %s: %v", obj.Digest, err)
+				return fmt.Errorf("failed to delete manifest, digest=%s, name=%s: %v", obj.Digest, obj.Name, err)
+			}
+			if opts.Accounting != nil {
+				if err := opts.Accounting.Debit(ctx, obj.Name, obj.Digest, accounting.RoleRevision); err != nil {
+					return fmt.Errorf("failed to debit removed manifest %s in %s: %w", obj.Digest, obj.Name, err)
+				}
 			}
 		}
 	}
@@ -192,6 +208,11 @@ func MarkAndSweep(ctx context.Context, storageDriver driver.StorageDriver, regis
 			err = vacuum.RemoveLayer(repo, dgst)
 			if err != nil {
 				return fmt.Errorf("failed to delete layer link %s of repo %s: %v", dgst, repo, err)
+			}
+			if opts.Accounting != nil {
+				if err := opts.Accounting.Debit(ctx, repo, dgst, accounting.RoleLayer); err != nil {
+					return fmt.Errorf("failed to debit removed layer link %s of repo %s: %w", dgst, repo, err)
+				}
 			}
 		}
 	}

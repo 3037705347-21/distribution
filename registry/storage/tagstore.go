@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/distribution/distribution/v3"
+	"github.com/distribution/distribution/v3/internal/dcontext"
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 )
 
@@ -108,7 +109,10 @@ func (ts *tagStore) Get(ctx context.Context, tag string) (v1.Descriptor, error) 
 	return v1.Descriptor{Digest: revision}, nil
 }
 
-// Untag removes the tag association
+// Untag removes the tag association. When accounting is enabled and
+// release_on_untag is set, revisions and blob links that become unreachable
+// from any remaining tag are removed and released from the ledger in the same
+// operation.
 func (ts *tagStore) Untag(ctx context.Context, tag string) error {
 	if !ts.deleteEnabled {
 		return distribution.ErrUnsupported
@@ -121,7 +125,19 @@ func (ts *tagStore) Untag(ctx context.Context, tag string) error {
 		return err
 	}
 
-	return ts.blobStore.driver.Delete(ctx, tagPath)
+	if err := ts.blobStore.driver.Delete(ctx, tagPath); err != nil {
+		return err
+	}
+
+	if ledger := ts.repository.ledger(); ledger != nil && ledger.ReleaseOnUntag() {
+		if err := ts.repository.reclaimAfterUntag(ctx); err != nil {
+			// Untag itself succeeded; reclaim failures are repaired by the
+			// next ledger reconciliation.
+			dcontext.GetLogger(ctx).WithError(err).
+				Warn("accounting: post-untag reclaim failed; ledger will reconcile")
+		}
+	}
+	return nil
 }
 
 // linkedBlobStore returns the linkedBlobStore for the named tag, allowing one

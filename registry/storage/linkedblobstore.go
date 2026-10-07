@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/internal/dcontext"
 	"github.com/distribution/distribution/v3/internal/uuid"
+	"github.com/distribution/distribution/v3/registry/storage/accounting"
 	"github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/reference"
 	"github.com/opencontainers/go-digest"
@@ -42,9 +44,22 @@ type linkedBlobStore struct {
 
 	// linkDirectoryPathSpec locates the root directories in which one might find links
 	linkDirectoryPathSpec pathSpec
+
+	// accountingRole is the ledger natural-key role for blobs linked through
+	// this store (layer links or manifest revision links).
+	accountingRole accounting.Role
 }
 
 var _ distribution.BlobStore = &linkedBlobStore{}
+
+// ledger returns the accounting service, or nil when accounting is disabled
+// or the linked store was constructed without a registry (tests).
+func (lbs *linkedBlobStore) ledger() *accounting.Service {
+	if lbs.registry == nil {
+		return nil
+	}
+	return lbs.registry.accounting
+}
 
 func (lbs *linkedBlobStore) Stat(ctx context.Context, dgst digest.Digest) (v1.Descriptor, error) {
 	return lbs.blobAccessController.Stat(ctx, dgst)
@@ -84,14 +99,39 @@ func (lbs *linkedBlobStore) ServeBlob(ctx context.Context, w http.ResponseWriter
 
 func (lbs *linkedBlobStore) Put(ctx context.Context, mediaType string, p []byte) (v1.Descriptor, error) {
 	dgst := digest.FromBytes(p)
+
+	// Reserve before any write so an over-budget inline put (manifest
+	// payload) fails before touching the blob store.
+	ledger := lbs.ledger()
+	var reservation *accounting.Reservation
+	if ledger != nil {
+		phase := accounting.PhaseManifest
+		role := lbs.accountingRole
+		if role == "" {
+			role = accounting.RoleLayer
+		}
+		res, err := ledger.Reserve(ctx, lbs.repository.Named().Name(), int64(len(p)), accounting.KindInline, dgst, phase)
+		if err != nil {
+			return v1.Descriptor{}, err
+		}
+		reservation = res
+	}
+	releaseReservation := func() {
+		if reservation != nil {
+			_ = ledger.Release(ctx, reservation)
+		}
+	}
+
 	// Place the data in the blob store first.
 	desc, err := lbs.blobStore.Put(ctx, mediaType, p)
 	if err != nil {
 		dcontext.GetLogger(ctx).Errorf("error putting into main store: %v", err)
+		releaseReservation()
 		return v1.Descriptor{}, err
 	}
 
 	if err := lbs.blobAccessController.SetDescriptor(ctx, dgst, desc); err != nil {
+		releaseReservation()
 		return v1.Descriptor{}, err
 	}
 
@@ -99,7 +139,22 @@ func (lbs *linkedBlobStore) Put(ctx context.Context, mediaType string, p []byte)
 	// returned by Put above. Note that we should allow updates for a given
 	// repository.
 
-	return desc, lbs.linkBlob(ctx, desc)
+	if err := lbs.linkBlob(ctx, desc); err != nil {
+		releaseReservation()
+		return v1.Descriptor{}, err
+	}
+
+	if reservation != nil {
+		role := lbs.accountingRole
+		if role == "" {
+			role = accounting.RoleLayer
+		}
+		if err := ledger.Settle(ctx, reservation, dgst, role, desc.Size); err != nil {
+			// The link is durable; reconciliation repairs a missing settle.
+			dcontext.GetLogger(ctx).WithError(err).Errorf("error settling ledger for inline put %s", dgst)
+		}
+	}
+	return desc, nil
 }
 
 type optionFunc func(any) error
@@ -143,6 +198,12 @@ func (lbs *linkedBlobStore) Create(ctx context.Context, options ...distribution.
 			// Mount successful, no need to initiate an upload session
 			return nil, distribution.ErrBlobMounted{From: opts.Mount.From, Descriptor: desc}
 		}
+		// A quota denial must surface to the client instead of silently
+		// falling back to a regular upload session.
+		var qe *accounting.ErrQuotaExceeded
+		if errors.As(err, &qe) {
+			return nil, err
+		}
 	}
 
 	uuid := uuid.NewString()
@@ -164,12 +225,27 @@ func (lbs *linkedBlobStore) Create(ctx context.Context, options ...distribution.
 		return nil, err
 	}
 
+	// Reserve (with the upload UUID as reservation ID so it can be rebound
+	// on resume) before any upload object is written.
+	var reservation *accounting.Reservation
+	if ledger := lbs.ledger(); ledger != nil {
+		res, err := ledger.ReserveWithID(ctx, uuid, lbs.repository.Named().Name(), 0,
+			accounting.KindUpload, "", accounting.PhaseUpload)
+		if err != nil {
+			return nil, err
+		}
+		reservation = res
+	}
+
 	// Write a startedat file for this upload
 	if err := lbs.blobStore.driver.PutContent(ctx, startedAtPath, []byte(startedAt.Format(time.RFC3339))); err != nil {
+		if reservation != nil {
+			_ = lbs.ledger().Release(ctx, reservation)
+		}
 		return nil, err
 	}
 
-	return lbs.newBlobUpload(ctx, uuid, path, startedAt, false)
+	return lbs.newBlobUpload(ctx, uuid, path, startedAt, false, reservation)
 }
 
 func (lbs *linkedBlobStore) Resume(ctx context.Context, id string) (distribution.BlobWriter, error) {
@@ -206,7 +282,28 @@ func (lbs *linkedBlobStore) Resume(ctx context.Context, id string) (distribution
 		return nil, err
 	}
 
-	return lbs.newBlobUpload(ctx, id, path, startedAt, true)
+	// Rebind the reservation created when the upload session started. A
+	// reservation that has been swept (crash/TTL recovery) means the upload
+	// can no longer be completed.
+	var reservation *accounting.Reservation
+	if ledger := lbs.ledger(); ledger != nil {
+		view, found, err := ledger.ActiveReservation(ctx, lbs.repository.Named().Name(), id)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return nil, distribution.ErrBlobUploadUnknown
+		}
+		reservation = &accounting.Reservation{
+			ID:     view.ID,
+			Repo:   lbs.repository.Named().Name(),
+			Size:   view.Size,
+			Kind:   view.Kind,
+			Digest: view.Digest,
+		}
+	}
+
+	return lbs.newBlobUpload(ctx, id, path, startedAt, true, reservation)
 }
 
 func (lbs *linkedBlobStore) Delete(ctx context.Context, dgst digest.Digest) error {
@@ -223,6 +320,20 @@ func (lbs *linkedBlobStore) Delete(ctx context.Context, dgst digest.Digest) erro
 	err = lbs.blobAccessController.Clear(ctx, dgst)
 	if err != nil {
 		return err
+	}
+
+	// Debit only this repository's (digest, role) natural key. Other
+	// repositories mounting the same blob keep their settled usage.
+	if ledger := lbs.ledger(); ledger != nil {
+		role := lbs.accountingRole
+		if role == "" {
+			role = accounting.RoleLayer
+		}
+		if err := ledger.Debit(ctx, lbs.repository.Named().Name(), dgst, role); err != nil {
+			dcontext.GetLogger(ctx).WithError(err).
+				WithField("digest", dgst).
+				Error("accounting: failed to debit ledger after blob link delete; reconciliation will repair")
+		}
 	}
 
 	return nil
@@ -297,11 +408,38 @@ func (lbs *linkedBlobStore) mount(ctx context.Context, sourceRepo reference.Name
 		MediaType: "application/octet-stream",
 		Digest:    dgst,
 	}
-	return desc, lbs.linkBlob(ctx, desc)
+
+	// Reserve before creating the link; the shared layer counts against the
+	// mounting repository's logical quota.
+	ledger := lbs.ledger()
+	var reservation *accounting.Reservation
+	if ledger != nil {
+		res, err := ledger.Reserve(ctx, lbs.repository.Named().Name(), stat.Size,
+			accounting.KindMount, dgst, accounting.PhaseMount)
+		if err != nil {
+			return v1.Descriptor{}, err
+		}
+		reservation = res
+	}
+
+	if err := lbs.linkBlob(ctx, desc); err != nil {
+		if reservation != nil {
+			_ = ledger.Release(ctx, reservation)
+		}
+		return v1.Descriptor{}, err
+	}
+
+	if reservation != nil {
+		if err := ledger.Settle(ctx, reservation, dgst, accounting.RoleLayer, stat.Size); err != nil {
+			// The link is durable; reconciliation repairs a missing settle.
+			dcontext.GetLogger(ctx).WithError(err).Errorf("error settling ledger for mount %s", dgst)
+		}
+	}
+	return desc, nil
 }
 
 // newBlobUpload allocates a new upload controller with the given state.
-func (lbs *linkedBlobStore) newBlobUpload(ctx context.Context, uuid, path string, startedAt time.Time, append bool) (distribution.BlobWriter, error) {
+func (lbs *linkedBlobStore) newBlobUpload(ctx context.Context, uuid, path string, startedAt time.Time, append bool, reservation *accounting.Reservation) (distribution.BlobWriter, error) {
 	fw, err := lbs.driver.Writer(ctx, path, append)
 	if err != nil {
 		return nil, err
@@ -316,6 +454,7 @@ func (lbs *linkedBlobStore) newBlobUpload(ctx context.Context, uuid, path string
 		fileWriter:             fw,
 		driver:                 lbs.driver,
 		path:                   path,
+		reservation:            reservation,
 		resumableDigestEnabled: lbs.resumableDigestEnabled,
 	}
 

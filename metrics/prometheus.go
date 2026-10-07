@@ -16,4 +16,8 @@ var (
 
 	// ProxyNamespace is the prometheus namespace of proxy related metrics
 	ProxyNamespace = metrics.NewNamespace(NamespacePrefix, "proxy", nil)
+
+	// AccountingNamespace is the prometheus namespace of per-repository
+	// usage ledger and quota metrics.
+	AccountingNamespace = metrics.NewNamespace(NamespacePrefix, "accounting", nil)
 )

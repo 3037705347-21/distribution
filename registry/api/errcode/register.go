@@ -224,6 +224,21 @@ var (
 		the maximum allowed.`,
 		HTTPStatusCode: http.StatusBadRequest,
 	})
+
+	// ErrorCodeQuotaExceeded is returned when a push, mount or manifest
+	// operation would make the repository exceed its configured storage
+	// budget. The operation is rejected before any irreversible write and
+	// the in-flight reservation is released.
+	ErrorCodeQuotaExceeded = register(errGroup, ErrorDescriptor{
+		Value:   "QUOTA_EXCEEDED",
+		Message: "repository storage quota exceeded",
+		Description: `Returned when accepting the upload, mount or manifest
+		put would exceed the repository's configured byte budget. The error
+		detail contains the repository name, configured limit, current settled
+		usage and requested size. No blob data or links are stored when this
+		error is returned.`,
+		HTTPStatusCode: http.StatusInsufficientStorage,
+	})
 )
 
 var (

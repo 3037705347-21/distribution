@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -10,6 +12,7 @@ import (
 	"github.com/distribution/distribution/v3/internal/dcontext"
 	"github.com/distribution/distribution/v3/registry/api/errcode"
 	"github.com/distribution/distribution/v3/registry/storage"
+	"github.com/distribution/distribution/v3/registry/storage/accounting"
 	"github.com/distribution/reference"
 	"github.com/gorilla/handlers"
 	"github.com/opencontainers/go-digest"
@@ -84,8 +87,12 @@ func (buh *blobUploadHandler) StartBlobUpload(w http.ResponseWriter, r *http.Req
 			if err := buh.writeBlobCreatedHeaders(w, ebm.Descriptor); err != nil {
 				buh.Errors = append(buh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
 			}
-		} else if err == distribution.ErrUnsupported {
+		} else if errors.Is(err, distribution.ErrUnsupported) {
 			buh.Errors = append(buh.Errors, errcode.ErrorCodeUnsupported)
+		} else if qerr, ok := asQuotaError(err); ok {
+			// mount or session reservation denied by quota: surface 507,
+			// do not fall through to an upload session.
+			buh.Errors = append(buh.Errors, qerr)
 		} else {
 			buh.Errors = append(buh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
 		}
@@ -164,10 +171,16 @@ func (buh *blobUploadHandler) PatchBlobData(w http.ResponseWriter, r *http.Reque
 			buh.Errors = append(buh.Errors, errcode.ErrorCodeSizeInvalid)
 			return
 		}
+
+		// Early quota gate using the declared chunk end before reading.
+		if err := buh.growReservation(r.Context(), end+1); err != nil {
+			buh.appendUploadError(err)
+			return
+		}
 	}
 
 	if err := copyFullPayload(buh, w, r, buh.Upload, -1, "blob PATCH"); err != nil {
-		buh.Errors = append(buh.Errors, errcode.ErrorCodeUnknown.WithDetail(err.Error()))
+		buh.appendUploadError(err)
 		return
 	}
 
@@ -213,6 +226,21 @@ func (buh *blobUploadHandler) PutBlobUploadComplete(w http.ResponseWriter, r *ht
 			buh.Errors = append(buh.Errors, errcode.ErrorCodeSizeInvalid)
 			return
 		}
+
+		// Early quota gate using the declared final end before reading.
+		if err := buh.growReservation(r.Context(), end+1); err != nil {
+			buh.appendUploadError(err)
+			return
+		}
+	} else if cl != "" {
+		// Monolithic/finishing PUT without Content-Range: gate on the
+		// declared body length as early as possible.
+		if clInt, err := strconv.ParseInt(cl, 10, 64); err == nil && clInt > 0 {
+			if err := buh.growReservation(r.Context(), buh.Upload.Size()+clInt); err != nil {
+				buh.appendUploadError(err)
+				return
+			}
+		}
 	}
 
 	dgstStr := r.FormValue("digest") // TODO(stevvooe): Support multiple digest parameters!
@@ -231,7 +259,7 @@ func (buh *blobUploadHandler) PutBlobUploadComplete(w http.ResponseWriter, r *ht
 	}
 
 	if err := copyFullPayload(buh, w, r, buh.Upload, -1, "blob PUT"); err != nil {
-		buh.Errors = append(buh.Errors, errcode.ErrorCodeUnknown.WithDetail(err.Error()))
+		buh.appendUploadError(err)
 		return
 	}
 
@@ -249,16 +277,20 @@ func (buh *blobUploadHandler) PutBlobUploadComplete(w http.ResponseWriter, r *ht
 		case errcode.Error:
 			buh.Errors = append(buh.Errors, err)
 		default:
-			switch err {
-			case distribution.ErrAccessDenied:
+			switch {
+			case errors.Is(err, distribution.ErrAccessDenied):
 				buh.Errors = append(buh.Errors, errcode.ErrorCodeDenied)
-			case distribution.ErrUnsupported:
+			case errors.Is(err, distribution.ErrUnsupported):
 				buh.Errors = append(buh.Errors, errcode.ErrorCodeUnsupported)
-			case distribution.ErrBlobInvalidLength, distribution.ErrBlobDigestUnsupported:
+			case errors.Is(err, distribution.ErrBlobInvalidLength), errors.Is(err, distribution.ErrBlobDigestUnsupported):
 				buh.Errors = append(buh.Errors, errcode.ErrorCodeBlobUploadInvalid.WithDetail(err))
 			default:
-				dcontext.GetLogger(buh).Errorf("unknown error completing upload: %v", err)
-				buh.Errors = append(buh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+				if qerr, ok := asQuotaError(err); ok {
+					buh.Errors = append(buh.Errors, qerr)
+				} else {
+					dcontext.GetLogger(buh).Errorf("unknown error completing upload: %v", err)
+					buh.Errors = append(buh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+				}
 			}
 
 		}
@@ -275,6 +307,41 @@ func (buh *blobUploadHandler) PutBlobUploadComplete(w http.ResponseWriter, r *ht
 		buh.Errors = append(buh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
 		return
 	}
+}
+
+// growReservation raises the ledger reservation backing the current upload
+// session to the declared absolute size before request bytes are processed.
+func (buh *blobUploadHandler) growReservation(ctx context.Context, size int64) error {
+	svc := buh.App.accounting
+	if svc == nil {
+		return nil
+	}
+	name := buh.Repository.Named().Name()
+	view, found, err := svc.ActiveReservation(ctx, name, buh.UUID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return distribution.ErrBlobUploadUnknown
+	}
+	res := &accounting.Reservation{
+		ID:     view.ID,
+		Repo:   name,
+		Size:   view.Size,
+		Kind:   view.Kind,
+		Digest: view.Digest,
+	}
+	return svc.Adjust(ctx, res, size, accounting.PhaseUpload)
+}
+
+// appendUploadError maps an upload error onto the response error list,
+// translating quota errors to QUOTA_EXCEEDED (507).
+func (buh *blobUploadHandler) appendUploadError(err error) {
+	if qerr, ok := asQuotaError(err); ok {
+		buh.Errors = append(buh.Errors, qerr)
+		return
+	}
+	buh.Errors = append(buh.Errors, errcode.ErrorCodeUnknown.WithDetail(err.Error()))
 }
 
 // CancelBlobUpload cancels an in-progress upload of a blob.

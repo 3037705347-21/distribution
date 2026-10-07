@@ -6,6 +6,7 @@ import (
 	"runtime"
 
 	"github.com/distribution/distribution/v3"
+	"github.com/distribution/distribution/v3/registry/storage/accounting"
 	"github.com/distribution/distribution/v3/registry/storage/cache"
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/reference"
@@ -31,6 +32,10 @@ type registry struct {
 	// Validation
 	manifestURLs         manifestURLs
 	validateImageIndexes validateImageIndexes
+
+	// accounting is the optional per-repository usage ledger service. When
+	// nil, push/mount/delete paths behave exactly as without accounting.
+	accounting *accounting.Service
 }
 
 // manifestURLs holds regular expressions for controlling manifest URL whitelisting
@@ -151,6 +156,15 @@ func BlobDescriptorCacheProvider(blobDescriptorCacheProvider cache.BlobDescripto
 	}
 }
 
+// AccountingService is a functional option for NewRegistry. It enables the
+// per-repository usage ledger and quota enforcement.
+func AccountingService(service *accounting.Service) RegistryOption {
+	return func(registry *registry) error {
+		registry.accounting = service
+		return nil
+	}
+}
+
 // NewRegistry creates a new registry instance from the provided driver. The
 // resulting registry may be shared by multiple goroutines but is cheap to
 // allocate. If the Redirect option is specified, the backend blob server will
@@ -191,6 +205,12 @@ func NewRegistry(ctx context.Context, driver storagedriver.StorageDriver, option
 // will only serve repositories contained within this scope.
 func (reg *registry) Scope() distribution.Scope {
 	return distribution.GlobalScope
+}
+
+// ledger returns the accounting service attached to this repository's
+// registry, or nil when accounting is disabled.
+func (repo *repository) ledger() *accounting.Service {
+	return repo.registry.accounting
 }
 
 // Repository returns an instance of the repository tied to the registry.
@@ -274,6 +294,7 @@ func (repo *repository) Manifests(ctx context.Context, options ...distribution.M
 		ctx:                  ctx,
 		blobStore:            repo.blobStore,
 		repository:           repo,
+		registry:             repo.registry,
 		deleteEnabled:        repo.registry.deleteEnabled,
 		blobAccessController: statter,
 
@@ -281,6 +302,7 @@ func (repo *repository) Manifests(ctx context.Context, options ...distribution.M
 		// manifests. This instance cannot be used for blob checks.
 		linkPath:              manifestRevisionLinkPath,
 		linkDirectoryPathSpec: manifestDirectoryPathSpec,
+		accountingRole:        accounting.RoleRevision,
 	}
 
 	manifestListHandler := &manifestListHandler{
@@ -355,5 +377,6 @@ func (repo *repository) Blobs(ctx context.Context) distribution.BlobStore {
 		linkDirectoryPathSpec:  layersPathSpec{name: repo.name.Name()},
 		deleteEnabled:          repo.registry.deleteEnabled,
 		resumableDigestEnabled: repo.resumableDigestEnabled,
+		accountingRole:         accounting.RoleLayer,
 	}
 }

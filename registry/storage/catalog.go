@@ -83,6 +83,13 @@ func (reg *registry) Enumerate(ctx context.Context, ingester func(string) error)
 
 // Remove removes a repository from storage
 func (reg *registry) Remove(ctx context.Context, name reference.Named) error {
+	// Remove the ledger first: if the physical deletion fails afterwards, the
+	// next reconciliation simply re-seeds it from storage.
+	if reg.accounting != nil {
+		if err := reg.accounting.DeleteRepository(ctx, name.Name()); err != nil {
+			return err
+		}
+	}
 	root, err := pathFor(repositoriesRootPathSpec{})
 	if err != nil {
 		return err

@@ -78,6 +78,59 @@ type Configuration struct {
 
 	// Policy configures registry policy options.
 	Policy Policy `yaml:"policy,omitempty"`
+
+	// Accounting configures the per-repository usage ledger and storage
+	// budgets. When disabled (the default) repository usage is not tracked
+	// and push/mount/delete behavior is unchanged.
+	Accounting Accounting `yaml:"accounting,omitempty"`
+}
+
+// Accounting configures the per-repository usage accounting ledger and
+// repository storage budgets.
+type Accounting struct {
+	// Enabled turns on per-repository accounting and quota enforcement.
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// ReleaseOnUntag makes deleting a tag immediately release the ledger
+	// usage of revisions and blobs that are no longer reachable from any
+	// remaining tag in the repository. Defaults to true when accounting is
+	// enabled; set explicitly to false to keep pre-GC release behavior.
+	ReleaseOnUntag *bool `yaml:"releaseonuntag,omitempty"`
+
+	// ReservationTTL is the age after which an abandoned reservation
+	// (interrupted push or mount request) may be released by the ledger
+	// sweep.
+	ReservationTTL time.Duration `yaml:"reservationttl,omitempty"`
+
+	// Reconcile controls startup and periodic reconciliation of the ledger
+	// against the physical repository state.
+	Reconcile AccountingReconcile `yaml:"reconcile,omitempty"`
+
+	// Budget configures per-repository byte budgets.
+	Budget AccountingBudget `yaml:"budget,omitempty"`
+}
+
+// AccountingReconcile configures ledger reconciliation runs.
+type AccountingReconcile struct {
+	// OnStart runs a full reconciliation before the registry starts serving.
+	OnStart bool `yaml:"onstart,omitempty"`
+
+	// Interval, when positive, runs a periodic reconciliation and reservation
+	// sweep. A zero value disables periodic runs.
+	Interval time.Duration `yaml:"interval,omitempty"`
+}
+
+// AccountingBudget configures repository byte budgets. A repository matching
+// no rule uses Default when set, and is otherwise unrestricted.
+type AccountingBudget struct {
+	// Default is the budget applied to repositories without a matching
+	// repository rule. An empty value means unrestricted by default.
+	Default string `yaml:"default,omitempty"`
+
+	// Repositories maps repository name globs ("*" does not cross a path
+	// component) to a size specification (e.g. "10GiB"). The most specific
+	// matching pattern wins.
+	Repositories map[string]string `yaml:"repositories,omitempty"`
 }
 
 // Policy defines configuration options for managing registry policies.

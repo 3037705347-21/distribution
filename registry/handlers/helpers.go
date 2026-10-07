@@ -11,7 +11,18 @@ import (
 
 	"github.com/distribution/distribution/v3/internal/dcontext"
 	"github.com/distribution/distribution/v3/registry/api/errcode"
+	"github.com/distribution/distribution/v3/registry/storage/accounting"
 )
+
+// asQuotaError maps an accounting.ErrQuotaExceeded onto the registry
+// QUOTA_EXCEEDED errcode (HTTP 507), preserving the structured detail.
+func asQuotaError(err error) (errcode.Error, bool) {
+	var qe *accounting.ErrQuotaExceeded
+	if errors.As(err, &qe) {
+		return errcode.ErrorCodeQuotaExceeded.WithDetail(qe), true
+	}
+	return errcode.Error{}, false
+}
 
 // closeResources closes all the provided resources after running the target
 // handler.

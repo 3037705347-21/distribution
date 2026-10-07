@@ -9,6 +9,18 @@ storage:
     rootdirectory: /var/lib/registry
   tag:
     concurrencylimit: 8
+# Per-repository usage ledger and quota enforcement. Disabled by default.
+# accounting:
+#   enabled: true
+#   releaseonuntag: true
+#   reservationttl: 24h
+#   reconcile:
+#     onstart: true
+#     interval: 1h
+#   budget:
+#     default: 10GiB
+#     repositories:
+#       "library/*": 100GiB
 http:
   addr: :5000
   headers:

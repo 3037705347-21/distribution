@@ -6,6 +6,7 @@ import (
 
 	"github.com/distribution/distribution/v3/internal/dcontext"
 	"github.com/distribution/distribution/v3/registry/storage"
+	"github.com/distribution/distribution/v3/registry/storage/accounting"
 	"github.com/distribution/distribution/v3/registry/storage/driver/factory"
 	"github.com/distribution/distribution/v3/version"
 	"github.com/spf13/cobra"
@@ -70,6 +71,27 @@ var GCCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
+		var ledger *accounting.Service
+		if config.Accounting.Enabled {
+			budgets, err := accounting.NewBudgets(config.Accounting.Budget.Default, config.Accounting.Budget.Repositories)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "invalid accounting configuration: %v\n", err)
+				os.Exit(1)
+			}
+			releaseOnUntag := true
+			if config.Accounting.ReleaseOnUntag != nil {
+				releaseOnUntag = *config.Accounting.ReleaseOnUntag
+			}
+			ledger, err = accounting.NewService(driver, budgets, accounting.RuntimeConfig{
+				ReleaseOnUntag: releaseOnUntag,
+				ReservationTTL: config.Accounting.ReservationTTL,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to construct accounting service: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
 		registry, err := storage.NewRegistry(ctx, driver)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to construct registry: %v", err)
@@ -80,6 +102,7 @@ var GCCmd = &cobra.Command{
 			DryRun:         dryRun,
 			RemoveUntagged: removeUntagged,
 			Quiet:          quiet,
+			Accounting:     ledger,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to garbage collect: %v", err)
